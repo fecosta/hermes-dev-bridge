@@ -1,0 +1,29 @@
+[Unit]
+Description=Hermes Dev Bridge acknowledgement service
+Requires=hermes-dev-bridge.socket
+After=hermes-dev-bridge.socket
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=hermes-fixture
+Group=hermes-fixture
+SupplementaryGroups=
+ExecStart=/usr/bin/python3 /opt/hermes-dev-bridge/lifecycle.py
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/opt/hermes-dev-bridge /etc/hermes-dev-bridge
+ReadWritePaths=/var/lib/hermes-fixture
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+MemoryMax=64M
+TasksMax=32
+UMask=0077
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
