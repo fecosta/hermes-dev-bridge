@@ -48,7 +48,7 @@ def validate_request(value: Any) -> dict[str, Any] | None:
 def _peer_uid(conn: socket.socket) -> int | None:
     try:
         raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
-        return struct.unpack("3i", raw)[0]
+        return struct.unpack("3i", raw)[1]
     except (AttributeError, OSError, struct.error):
         return None
 
