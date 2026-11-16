@@ -1,0 +1,10 @@
+name: hermes_dev_bridge
+version: 0.1.0
+description: "Submit one fixed acknowledgement-only request to the local Hermes development bridge."
+author: Hermes
+kind: standalone
+platforms:
+  - linux
+provides_tools:
+  - bridge_smoke
+provides_hooks: []
