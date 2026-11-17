@@ -8,4 +8,5 @@ platforms:
 provides_tools:
   - bridge_smoke
   - bridge_execute_smoke
+  - bridge_pfy_preflight
 provides_hooks: []

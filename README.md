@@ -1,6 +1,6 @@
-# Hermes Dev Bridge — U2.1
+# Hermes Dev Bridge — U5.2
 
-The bridge accepts only the deterministic `fixture` repository and `preflight`, `status`, or `smoke` operations. It rejects commands, paths, environment overrides, model overrides, and unsupported fields.
+The bridge accepts only the deterministic `fixture` repository and `preflight`, `status`, or `smoke` operations, plus the read-only `pfy/preflight` readiness snapshot. It rejects commands, paths, environment overrides, model overrides, and unsupported fields.
 
 ## Security behavior
 
@@ -10,7 +10,7 @@ The fixture uses a fixed interpreter command, `stdin=DEVNULL`, minimal `PATH`, a
 
 Cleanup failures fail closed: `execute` returns `status: "failed"`, `cleanup: "failed"`, `error` (`PROCESS_GROUP_CLEANUP_FAILED` or `WORKSPACE_CLEANUP_FAILED`), `fixture_exit_code`, and `artifacts` (leftover `workspace` directory name, `process_group` and `process_group_pids`, and the full `errors` list) for the operator to clean up. The in-memory run registry holds at most 1000 runs, then rejects with `RUN_REGISTRY_FULL` until restart. Run IDs are not reusable within a process lifetime.
 
-No OpenCode, Telegram, GitHub, PFY, Hermes, or production integration exists.
+No OpenCode, Telegram, GitHub, Hermes, or production execution integration exists. The bridge does not access the PFY repository; it only reads the operator-managed readiness snapshot.
 
 ## Operator-only installation/staging
 
@@ -31,6 +31,8 @@ sudo -u "#$UID_W" -g "#$GID_W" -- /usr/bin/python3 /opt/hermes-dev-bridge/bridge
 
 Check that `id` prints exactly the worker UID and GID with no extra `groups=`; the bridge reports `IDENTITY_MISMATCH` otherwise. If the smoke run returns `blocked`, the `error` field names the failed check.
 
+To stage PFY preflight, create `/etc/hermes-dev-bridge/pfy-readiness.json` as root with mode `0644` (readable by the worker, not group/world-writable) and content that satisfies the schema above. The bridge does not refresh this file automatically; the operator must rewrite it when readiness changes.
+
 Do not run privileged commands automatically. Before staging, verify the installed source is the intended reviewed file and that the worker cannot write `/opt/hermes-dev-bridge`, `/etc/hermes-dev-bridge`, or any parent of `/var/lib/hermes-fixture`.
 
 ## One-use execution authorization (U4.4)
@@ -44,6 +46,41 @@ Execution requires a durable, operator-controlled one-use grant. The bridge read
 Each `grant_id` authorizes exactly one execution attempt of the fixed `smoke` fixture. Consumption is recorded in the SQLite ledger and survives restart, failure, timeout, and uncertain (`recovery-required`) outcomes. Hermes cannot create, renew, reset, or revoke grants. Removing a consumed grant from the configuration does not make it available again; adding a new `grant_id` makes one additional attempt available.
 
 Missing or invalid authorization fails closed. If no unconsumed `smoke` grant exists, `bridge_execute_smoke` receives `state: "blocked"`, `error_code: "GRANT_EXHAUSTED"`.
+
+## PFY readiness preflight (U5.2)
+
+`bridge_pfy_preflight` is a parameter-free Hermes tool that requests a read-only readiness snapshot. The bridge never touches the PFY repository; it reads only the operator-controlled file `/etc/hermes-dev-bridge/pfy-readiness.json`.
+
+Request (fixed):
+```json
+{"request_id":"<id>","operation":"pfy/preflight","repository":"fixture","timeout_seconds":5}
+```
+
+The bridge verifies, before trusting the file:
+- absolute trusted path under `/etc/hermes-dev-bridge`, no symlinks;
+- regular file, root-owned, not group/world-writable;
+- size at most 64 KiB;
+- strict JSON schema: exactly `generated_at`, `source_revision`, `ready`, `blockers`, `max_age_seconds`;
+- valid types and consistency (`ready: true` only with an empty `blockers` list);
+- freshness: `now <= generated_at + max_age_seconds`.
+
+Failures are reported as `status: "blocked"`, `ready: false`, with one of:
+`PFY_READINESS_UNVERIFIED`, `PFY_READINESS_OVERSIZED`, `PFY_READINESS_INVALID`, `PFY_READINESS_STALE`, `PFY_READINESS_BLOCKED`.
+
+A verified, ready snapshot returns:
+```json
+{"status":"acknowledged","state":"ready","ready":true,
+ "generation_time":<float>,"source_revision":"<rev>","blockers":[]}
+```
+
+`ready: true` does **not** authorize execution. `execute: true` is rejected for `pfy/preflight` and never consumes a `smoke` grant.
+
+The operator creates `/etc/hermes-dev-bridge/pfy-readiness.json` manually. Example blocked metadata:
+```json
+{"generated_at":1731849600.0,"source_revision":"pfy-abc123",
+ "ready":false,"blockers":["dirty working tree","Node-version drift unresolved"],
+ "max_age_seconds":3600}
+```
 
 ## Current verification
 

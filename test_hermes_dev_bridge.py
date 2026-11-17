@@ -47,6 +47,65 @@ class SmokeTests(unittest.TestCase):
             self.assertNotIn("subprocess", source.read())
 
 
+class PFYPreflightToolTests(unittest.TestCase):
+    def call(self, response):
+        conn = Conn(response)
+        with patch.object(tools.socket, "socket", return_value=conn), patch.object(tools.secrets, "token_hex", return_value="a" * 32):
+            result = json.loads(tools.bridge_pfy_preflight({}))
+        return result, conn
+
+    def _base_response(self, status, state, ready, **extra):
+        response = {
+            "status": status,
+            "request_id": "hermes-dev-bridge-" + "a" * 32,
+            "operation": "pfy/preflight",
+            "repository": "fixture",
+            "state": state,
+            "ready": ready,
+            "generation_time": 1234567890.0,
+            "source_revision": "rev1",
+            "blockers": [],
+            "evidence": "pfy readiness",
+        }
+        response.update(extra)
+        return (json.dumps(response, separators=(",", ":")) + "\n").encode("ascii")
+
+    def test_ready_report(self):
+        result, conn = self.call(self._base_response("acknowledged", "ready", True))
+        self.assertTrue(result["success"])
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["source_revision"], "rev1")
+        self.assertEqual(json.loads(conn.sent), {
+            "request_id": "hermes-dev-bridge-" + "a" * 32,
+            "operation": "pfy/preflight",
+            "repository": "fixture",
+            "timeout_seconds": 5,
+        })
+
+    def test_blocked_report(self):
+        result, _ = self.call(self._base_response("blocked", "blocked", False, error_code="PFY_READINESS_BLOCKED", blockers=["dirty tree"]))
+        self.assertFalse(result["success"])
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["error"], "PFY_READINESS_BLOCKED")
+        self.assertEqual(result["blockers"], ["dirty tree"])
+
+    def test_malformed_response(self):
+        for response in [b"not-json\n", b"x" * tools._MAX_FRAME]:
+            result, _ = self.call(response)
+            self.assertFalse(result["success"])
+            self.assertIn(result["error"], {"MALFORMED_RESPONSE", "OVERSIZED_RESPONSE"})
+
+    def test_connection_failure(self):
+        with patch.object(tools.socket, "socket", side_effect=FileNotFoundError):
+            result = json.loads(tools.bridge_pfy_preflight({}))
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "SOCKET_UNAVAILABLE")
+
+    def test_no_args_or_overrides(self):
+        from hermes_dev_bridge import _PFY_SCHEMA
+        self.assertEqual(_PFY_SCHEMA["parameters"]["additionalProperties"], False)
+
+
 class ExecuteSmokeTests(unittest.TestCase):
     def call(self, response):
         conn = Conn(response)

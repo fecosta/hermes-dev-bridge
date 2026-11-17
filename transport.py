@@ -5,6 +5,7 @@ import os
 import socket
 import stat
 import struct
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,11 @@ LEDGER_PATH = "/var/lib/hermes-fixture/runs.sqlite3"  # operator-controlled; nev
 AUTHORIZED_PEER_UIDS = frozenset({997})
 
 EXECUTION_CONFIG_PATH = Path("/etc/hermes-dev-bridge/execution.json")
+PFY_READINESS_PATH = Path("/etc/hermes-dev-bridge/pfy-readiness.json")
+PFY_OPERATION = "pfy/preflight"
+MAX_PFY_SIZE = 64 * 1024
+MAX_PFY_BLOCKERS = 16
+MAX_PFY_BLOCKER_LEN = 128
 
 
 def _secure_file(path: Path, owner: int = 0) -> bool:
@@ -80,6 +86,129 @@ def load_execution_allowlist(path: Path = EXECUTION_CONFIG_PATH) -> list[dict[st
         raise RuntimeError("EXECUTION_CONFIG_UNVERIFIED") from exc
 
 
+def _read_pfy_readiness(path: Path, now: float | None = None) -> dict[str, Any]:
+    """Read and validate the operator-controlled PFY readiness snapshot.
+
+    Returns a fail-closed result.  The file is never trusted until its path,
+    ownership, permissions, size, schema, and freshness have been verified.
+    """
+    now = time.time() if now is None else now
+    failure = {
+        "ready": False,
+        "valid": False,
+        "generation_time": None,
+        "source_revision": None,
+        "blockers": [],
+        "error_code": "PFY_READINESS_UNVERIFIED",
+        "evidence": "PFY readiness metadata could not be verified",
+    }
+    if not _trusted_chain(path) or not _secure_file(path):
+        return {**failure, "error_code": "PFY_READINESS_UNVERIFIED", "evidence": "PFY readiness file failed trusted-path verification"}
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return {**failure, "error_code": "PFY_READINESS_UNVERIFIED", "evidence": "PFY readiness file could not be opened"}
+    try:
+        size = os.fstat(fd).st_size
+        if size > MAX_PFY_SIZE:
+            return {**failure, "error_code": "PFY_READINESS_OVERSIZED", "evidence": "PFY readiness file exceeds size limit"}
+        data = b""
+        while len(data) < MAX_PFY_SIZE + 1:
+            chunk = os.read(fd, 8192)
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > MAX_PFY_SIZE:
+            return {**failure, "error_code": "PFY_READINESS_OVERSIZED", "evidence": "PFY readiness file exceeds size limit"}
+        try:
+            value = json.loads(data.decode("utf-8", errors="replace"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return {**failure, "error_code": "PFY_READINESS_INVALID", "evidence": "PFY readiness file is not valid JSON"}
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    if not isinstance(value, dict):
+        return {**failure, "error_code": "PFY_READINESS_INVALID", "evidence": "PFY readiness metadata is not a JSON object"}
+    expected_keys = {"generated_at", "source_revision", "ready", "blockers", "max_age_seconds"}
+    if set(value) != expected_keys:
+        return {**failure, "error_code": "PFY_READINESS_INVALID", "evidence": "PFY readiness metadata has incorrect fields"}
+
+    generated_at = value["generated_at"]
+    source_revision = value["source_revision"]
+    ready = value["ready"]
+    blockers = value["blockers"]
+    max_age = value["max_age_seconds"]
+
+    if (
+        isinstance(generated_at, bool)
+        or not isinstance(generated_at, (int, float))
+        or isinstance(source_revision, bool)
+        or not isinstance(source_revision, str)
+        or not isinstance(ready, bool)
+        or isinstance(blockers, bool)
+        or not isinstance(blockers, list)
+        or isinstance(max_age, bool)
+        or not isinstance(max_age, (int, float))
+        or max_age <= 0
+    ):
+        return {**failure, "error_code": "PFY_READINESS_INVALID", "evidence": "PFY readiness metadata has invalid types"}
+
+    if not all(isinstance(b, str) and not isinstance(b, bool) for b in blockers):
+        return {**failure, "error_code": "PFY_READINESS_INVALID", "evidence": "PFY readiness blockers must be strings"}
+    if ready and blockers:
+        return {**failure, "error_code": "PFY_READINESS_INVALID", "evidence": "PFY readiness claims ready with unresolved blockers"}
+
+    safe_blockers: list[str] = []
+    for b in blockers[:MAX_PFY_BLOCKERS]:
+        safe = bridge._sanitize(b[:MAX_PFY_BLOCKER_LEN])
+        if safe and safe not in safe_blockers:
+            safe_blockers.append(safe)
+
+    if now > generated_at + max_age:
+        return {
+            **failure,
+            "generation_time": float(generated_at),
+            "source_revision": source_revision,
+            "blockers": safe_blockers,
+            "error_code": "PFY_READINESS_STALE",
+            "evidence": "PFY readiness snapshot has expired",
+        }
+
+    return {
+        "ready": ready,
+        "valid": True,
+        "generation_time": float(generated_at),
+        "source_revision": source_revision,
+        "blockers": safe_blockers,
+        "error_code": None if ready else "PFY_READINESS_BLOCKED",
+        "evidence": "PFY readiness snapshot verified" if ready else "PFY readiness snapshot reports blockers",
+    }
+
+
+def _pfy_response(request_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    revision = result["source_revision"]
+    if isinstance(revision, str):
+        revision = revision[:128]
+    response: dict[str, Any] = {
+        "status": "acknowledged" if result["ready"] else "blocked",
+        "request_id": request_id,
+        "operation": PFY_OPERATION,
+        "repository": "fixture",
+        "state": "ready" if result["ready"] else "blocked",
+        "ready": result["ready"],
+        "generation_time": result["generation_time"],
+        "source_revision": revision,
+        "blockers": result["blockers"],
+        "evidence": result["evidence"],
+    }
+    if result["error_code"]:
+        response["error_code"] = result["error_code"]
+    return response
+
+
 REQUEST_FIELDS = {"request_id", "operation", "repository", "timeout_seconds", "execute"}
 
 
@@ -98,7 +227,7 @@ def validate_request(value: Any) -> dict[str, Any] | None:
         r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", request_id
     ):
         return None
-    if value.get("operation") not in bridge.ALLOWED_OPERATIONS:
+    if value.get("operation") not in (bridge.ALLOWED_OPERATIONS | {PFY_OPERATION}):
         return None
     if value.get("repository") != bridge.ALLOWED_REPOSITORY:
         return None
@@ -204,6 +333,8 @@ def handle_connection(conn: socket.socket, authorized_uids: frozenset[int] = AUT
                 request = validate_request(value)
                 if request is None:
                     response = _error("INVALID_REQUEST")
+                elif request["operation"] == PFY_OPERATION and request.get("execute"):
+                    response = _error("INVALID_REQUEST")
                 else:
                     try:
                         ledger = ledger or Ledger(LEDGER_PATH)
@@ -245,16 +376,32 @@ def handle_connection(conn: socket.socket, authorized_uids: frozenset[int] = AUT
                                             row = _map_bridge_result(ledger, request["request_id"], result)
                                             response = _terminal_response(row)
                         else:
-                            if row["state"] == "accepted":
-                                row = ledger.transition(request["request_id"], "acknowledged", evidence="not executed; dispatch unavailable")
-                            response = {
-                                "status": "acknowledged",
-                                "request_id": row["request_id"],
-                                "operation": row["operation"],
-                                "repository": row["repository"],
-                                "state": row["state"],
-                                "evidence": row["evidence"],
-                            }
+                            if request["operation"] == PFY_OPERATION:
+                                result = _read_pfy_readiness(PFY_READINESS_PATH)
+                                if row["state"] == "accepted":
+                                    if result["ready"]:
+                                        ledger.transition(
+                                            request["request_id"], "acknowledged",
+                                            evidence=result["evidence"],
+                                        )
+                                    else:
+                                        ledger.transition(
+                                            request["request_id"], "blocked",
+                                            evidence=result["evidence"],
+                                            error_code=result["error_code"],
+                                        )
+                                response = _pfy_response(request["request_id"], result)
+                            else:
+                                if row["state"] == "accepted":
+                                    row = ledger.transition(request["request_id"], "acknowledged", evidence="not executed; dispatch unavailable")
+                                response = {
+                                    "status": "acknowledged",
+                                    "request_id": row["request_id"],
+                                    "operation": row["operation"],
+                                    "repository": row["repository"],
+                                    "state": row["state"],
+                                    "evidence": row["evidence"],
+                                }
                     except RequestReuse:
                         response = _error("REQUEST_ID_REUSE")
                     except LedgerFull:

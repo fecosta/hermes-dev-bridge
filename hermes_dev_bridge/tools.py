@@ -10,6 +10,7 @@ SOCKET_PATH = "/run/hermes-dev-bridge/bridge.sock"
 _CONNECT_TIMEOUT = 2.0
 _READ_TIMEOUT_ACK = 2.0
 _READ_TIMEOUT_EXEC = 10.0
+_READ_TIMEOUT_PFY = 5.0
 _MAX_FRAME = 4096
 _REQUEST_ID_BYTES = 16
 
@@ -125,6 +126,55 @@ def bridge_execute_smoke(_args: dict[str, Any], **_kwargs: Any) -> str:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
             response = _send_request(conn, request, _READ_TIMEOUT_EXEC)
         return json.dumps(_validate_execute_response(response, request_id), separators=(",", ":"))
+    except socket.timeout:
+        return _error("SOCKET_TIMEOUT", request_id)
+    except (FileNotFoundError, ConnectionRefusedError, NotADirectoryError):
+        return _error("SOCKET_UNAVAILABLE", request_id)
+    except (OSError, UnicodeDecodeError):
+        return _error("TRANSPORT_ERROR", request_id)
+    except json.JSONDecodeError:
+        return _error("MALFORMED_RESPONSE", request_id)
+    except ValueError as exc:
+        return _error(str(exc), request_id)
+
+
+def _validate_pfy_response(value: Any, request_id: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("MALFORMED_RESPONSE")
+    if value.get("request_id") != request_id:
+        raise ValueError("MALFORMED_RESPONSE")
+    if value.get("operation") != "pfy/preflight" or value.get("repository") != "fixture":
+        raise ValueError("MALFORMED_RESPONSE")
+    status = value.get("status")
+    state = value.get("state")
+    if status not in ("acknowledged", "blocked") or state not in ("ready", "blocked"):
+        raise ValueError("MALFORMED_RESPONSE")
+    ready = value.get("ready")
+    if not isinstance(ready, bool):
+        raise ValueError("MALFORMED_RESPONSE")
+    blockers = value.get("blockers", [])
+    if not isinstance(blockers, list) or not all(isinstance(b, str) for b in blockers):
+        raise ValueError("MALFORMED_RESPONSE")
+    result: dict[str, Any] = {
+        "success": ready and status == "acknowledged" and state == "ready",
+        "ready": ready,
+        "request_id": request_id,
+        "generation_time": value.get("generation_time"),
+        "source_revision": value.get("source_revision"),
+        "blockers": blockers,
+    }
+    if not result["success"]:
+        result["error"] = value.get("error_code") or "PFY_READINESS_BLOCKED"
+    return result
+
+
+def bridge_pfy_preflight(_args: dict[str, Any], **_kwargs: Any) -> str:
+    request_id = _request_id()
+    request = {"request_id": request_id, "operation": "pfy/preflight", "repository": "fixture", "timeout_seconds": 5}
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            response = _send_request(conn, request, _READ_TIMEOUT_PFY)
+        return json.dumps(_validate_pfy_response(response, request_id), separators=(",", ":"))
     except socket.timeout:
         return _error("SOCKET_TIMEOUT", request_id)
     except (FileNotFoundError, ConnectionRefusedError, NotADirectoryError):
