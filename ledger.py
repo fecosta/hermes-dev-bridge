@@ -9,9 +9,14 @@ MAX_EVIDENCE = 16384
 MAX_STORAGE = 4 * 1024 * 1024
 CAPACITY_RESERVE = 64 * 1024  # conservative headroom for one SQLite transaction
 RETENTION_SECONDS = 30 * 86400
+# ponytail: at-most-once dispatch is bounded by ledger retention/record limits;
+# for indefinite request-id uniqueness, archive executed IDs outside this ledger.
 STATES = {"accepted", "acknowledged", "running", "passed", "failed", "blocked", "recovery-required"}
 TERMINAL = {"acknowledged", "passed", "failed", "blocked", "recovery-required"}
-TRANSITIONS = {"accepted": {"running", "acknowledged", "recovery-required"}, "running": TERMINAL}
+TRANSITIONS = {
+    "accepted": {"running", "acknowledged", "blocked", "recovery-required"},
+    "running": {"passed", "failed", "blocked", "recovery-required"},
+}
 
 class LedgerError(Exception): pass
 class LedgerFull(LedgerError): pass
@@ -28,7 +33,10 @@ _SCHEMA = """CREATE TABLE IF NOT EXISTS runs (
 
 
 def canonical_hash(request: dict[str, Any]) -> str:
-    body = {k: request[k] for k in ("request_id", "operation", "repository", "timeout_seconds") if k in request}
+    keys = ("request_id", "operation", "repository", "timeout_seconds")
+    body = {k: request[k] for k in keys if k in request}
+    if request.get("execute"):
+        body["execute"] = True
     return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -112,19 +120,61 @@ class Ledger:
             except sqlite3.Error: pass
             raise LedgerError("LEDGER_UNAVAILABLE") from exc
 
+    def dispatch_running(self, request_id: str) -> dict[str, Any] | None:
+        """Atomically claim an accepted row for dispatch. Only the winner may execute."""
+        now = time.time()
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self.db.execute(
+                    "UPDATE runs SET state='running', started_at=? WHERE request_id=? AND state='accepted'",
+                    (now, request_id),
+                )
+                if cur.rowcount != 1:
+                    self.db.execute("COMMIT")
+                    return None
+                self.db.execute("COMMIT")
+                return self.get(request_id)
+            except Exception:
+                try: self.db.execute("ROLLBACK")
+                except sqlite3.Error: pass
+                raise
+        except (sqlite3.Error, OSError) as exc:
+            raise LedgerError("LEDGER_UNAVAILABLE") from exc
+
     def transition(self, request_id, state, **fields):
         if state not in STATES: raise InvalidTransition("INVALID_STATE")
-        row = self.get(request_id)
-        if state not in TRANSITIONS.get(row["state"], set()): raise InvalidTransition("INVALID_TRANSITION")
-        now = time.time(); started = now if state == "running" else row["started_at"]
-        ended = now if state in TERMINAL else row["ended_at"]
-        evidence = _safe_text(fields.get("evidence", row["evidence"]))
-        error = _safe_text(fields.get("error_code", row["error_code"]))
-        cleanup = _safe_text(fields.get("cleanup_status", row["cleanup_status"]))
+        now = time.time()
         try:
-            self.db.execute("UPDATE runs SET state=?,started_at=?,ended_at=?,exit_code=?,evidence=?,error_code=?,cleanup_status=? WHERE request_id=?", (state, started, ended, fields.get("exit_code", row["exit_code"]), evidence, error, cleanup, request_id))
-            return self.get(request_id)
-        except sqlite3.Error as exc: raise LedgerError("LEDGER_UNAVAILABLE") from exc
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.get(request_id)
+                old_state = row["state"]
+                if state not in TRANSITIONS.get(old_state, set()):
+                    self.db.execute("ROLLBACK")
+                    raise InvalidTransition("INVALID_TRANSITION")
+                started = now if state == "running" else row["started_at"]
+                ended = now if state in TERMINAL else row["ended_at"]
+                evidence = _safe_text(fields.get("evidence", row["evidence"]))
+                error = _safe_text(fields.get("error_code", row["error_code"]))
+                cleanup = _safe_text(fields.get("cleanup_status", row["cleanup_status"]))
+                cur = self.db.execute(
+                    "UPDATE runs SET state=?,started_at=?,ended_at=?,exit_code=?,evidence=?,error_code=?,cleanup_status=? WHERE request_id=? AND state=?",
+                    (state, started, ended, fields.get("exit_code", row["exit_code"]), evidence, error, cleanup, request_id, old_state),
+                )
+                if cur.rowcount != 1:
+                    self.db.execute("ROLLBACK")
+                    raise InvalidTransition("INVALID_TRANSITION")
+                self.db.execute("COMMIT")
+                return self.get(request_id)
+            except InvalidTransition:
+                raise
+            except Exception:
+                try: self.db.execute("ROLLBACK")
+                except sqlite3.Error: pass
+                raise
+        except (sqlite3.Error, OSError) as exc:
+            raise LedgerError("LEDGER_UNAVAILABLE") from exc
 
     def get(self, request_id):
         try:

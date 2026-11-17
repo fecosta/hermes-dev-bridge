@@ -3,7 +3,9 @@
 import json
 import os
 import socket
+import stat
 import struct
+from pathlib import Path
 from typing import Any
 
 import bridge
@@ -17,7 +19,52 @@ LEDGER_PATH = "/var/lib/hermes-fixture/runs.sqlite3"  # operator-controlled; nev
 # Explicit operator-controlled default. Deployment must replace this value deliberately.
 AUTHORIZED_PEER_UIDS = frozenset({997})
 
-REQUEST_FIELDS = {"request_id", "operation", "repository", "timeout_seconds"}
+EXECUTION_CONFIG_PATH = Path("/etc/hermes-dev-bridge/execution.json")
+
+
+def _secure_file(path: Path, owner: int = 0) -> bool:
+    try:
+        s = path.lstat()
+        return stat.S_ISREG(s.st_mode) and s.st_uid == owner and not s.st_mode & 0o022
+    except OSError:
+        return False
+
+
+def _trusted_chain(path: Path) -> bool:
+    try:
+        current = path
+        if current.is_symlink() or not current.is_file():
+            return False
+        while True:
+            s = current.lstat()
+            if current != path and (s.st_uid != 0 or s.st_mode & 0o022):
+                return False
+            if current == current.parent:
+                return True
+            current = current.parent
+    except OSError:
+        return False
+
+
+def load_execution_allowlist(path: Path = EXECUTION_CONFIG_PATH) -> frozenset[str]:
+    """Operator-controlled execution allowlist. Missing config disables execution."""
+    if not path.exists():
+        return frozenset()
+    if not _trusted_chain(path) or not _secure_file(path):
+        raise RuntimeError("EXECUTION_CONFIG_UNVERIFIED")
+    try:
+        value = json.loads(path.read_text())
+        if not isinstance(value, dict) or set(value.keys()) != {"execute_operations"}:
+            raise RuntimeError("EXECUTION_CONFIG_INVALID")
+        ops = value["execute_operations"]
+        if not isinstance(ops, list) or not all(isinstance(op, str) and op in bridge.ALLOWED_OPERATIONS for op in ops):
+            raise RuntimeError("EXECUTION_CONFIG_INVALID")
+        return frozenset(ops)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("EXECUTION_CONFIG_UNVERIFIED") from exc
+
+
+REQUEST_FIELDS = {"request_id", "operation", "repository", "timeout_seconds", "execute"}
 
 
 def _error(code: str) -> dict[str, str]:
@@ -42,7 +89,10 @@ def validate_request(value: Any) -> dict[str, Any] | None:
     timeout = value.get("timeout_seconds", bridge.DEFAULT_TIMEOUT)
     if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 30:
         return None
-    return value
+    execute = value.get("execute", False)
+    if execute is not False and execute is not True:
+        return None
+    return {**value, "execute": execute}
 
 
 def _peer_uid(conn: socket.socket) -> int | None:
@@ -68,7 +118,59 @@ def _read_frame(conn: socket.socket) -> bytes | None:
     return None
 
 
-def handle_connection(conn: socket.socket, authorized_uids: frozenset[int] = AUTHORIZED_PEER_UIDS, ledger=None) -> None:
+def _terminal_response(row: dict[str, Any]) -> dict[str, Any]:
+    status_map = {
+        "acknowledged": "acknowledged",
+        "running": "running",
+        "passed": "completed",
+        "failed": "completed",
+        "blocked": "blocked",
+        "recovery-required": "completed",
+    }
+    response = {
+        "status": status_map[row["state"]],
+        "request_id": row["request_id"],
+        "operation": row["operation"],
+        "repository": row["repository"],
+        "state": row["state"],
+        "evidence": row["evidence"],
+    }
+    if row["exit_code"] is not None:
+        response["exit_code"] = row["exit_code"]
+    if row["error_code"]:
+        response["error_code"] = row["error_code"]
+    return response
+
+
+def _map_bridge_result(ledger: Ledger, request_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    status = result.get("status")
+    if status == "passed":
+        return ledger.transition(request_id, "passed", exit_code=result.get("exit_code"), evidence=result.get("evidence"))
+    if status == "failed":
+        error_code = result.get("error")
+        evidence = result.get("evidence") or ""
+        if result.get("exit_code") == 124 and not error_code:
+            error_code = "EXECUTION_TIMEOUT"
+        if result.get("fixture_exit_code") is not None or result.get("artifacts"):
+            details = json.dumps(
+                {"fixture_exit_code": result.get("fixture_exit_code"), "artifacts": result.get("artifacts")},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            evidence = f"{evidence}; details={details}"
+        return ledger.transition(
+            request_id, "failed",
+            exit_code=result.get("exit_code"),
+            evidence=evidence,
+            error_code=error_code,
+            cleanup_status=result.get("cleanup"),
+        )
+    if status == "blocked":
+        return ledger.transition(request_id, "blocked", evidence=result.get("evidence"), error_code=result.get("error"))
+    return ledger.transition(request_id, "blocked", evidence=result.get("error") or f"bridge returned {status}", error_code="BRIDGE_REJECTED")
+
+
+def handle_connection(conn: socket.socket, authorized_uids: frozenset[int] = AUTHORIZED_PEER_UIDS, ledger=None, execution_ops: frozenset[str] = frozenset()) -> None:
     conn.settimeout(READ_TIMEOUT)
     try:
         if _peer_uid(conn) not in authorized_uids:
@@ -90,16 +192,52 @@ def handle_connection(conn: socket.socket, authorized_uids: frozenset[int] = AUT
                     try:
                         ledger = ledger or Ledger(LEDGER_PATH)
                         row = ledger.reserve(request)
-                        if row["state"] == "accepted":
-                            row = ledger.transition(request["request_id"], "acknowledged", evidence="not executed; dispatch unavailable")
-                        response = {
-                            "status": "acknowledged",
-                            "request_id": row["request_id"],
-                            "operation": row["operation"],
-                            "repository": row["repository"],
-                            "state": row["state"],
-                            "evidence": row["evidence"],
-                        }
+                        if request.get("execute"):
+                            if request["operation"] not in execution_ops:
+                                if row["state"] == "accepted":
+                                    row = ledger.transition(
+                                        request["request_id"], "blocked",
+                                        error_code="EXECUTION_DISABLED",
+                                        evidence="execution disabled or operation not authorized",
+                                    )
+                                response = _terminal_response(row)
+                            elif row["state"] != "accepted":
+                                response = _terminal_response(row)
+                            else:
+                                claimed = ledger.dispatch_running(request["request_id"])
+                                if claimed is None:
+                                    row = ledger.get(request["request_id"])
+                                    response = _terminal_response(row)
+                                else:
+                                    bridge_request = {
+                                        "run_id": request["request_id"],
+                                        "operation": request["operation"],
+                                        "repository": request["repository"],
+                                        "timeout_seconds": request.get("timeout_seconds", bridge.DEFAULT_TIMEOUT),
+                                    }
+                                    try:
+                                        result = bridge.execute(bridge_request)
+                                    except Exception as exc:
+                                        row = ledger.transition(
+                                            request["request_id"], "recovery-required",
+                                            error_code="EXECUTION_UNCERTAIN",
+                                            evidence=bridge._sanitize(str(exc)),
+                                        )
+                                        response = _terminal_response(row)
+                                    else:
+                                        row = _map_bridge_result(ledger, request["request_id"], result)
+                                        response = _terminal_response(row)
+                        else:
+                            if row["state"] == "accepted":
+                                row = ledger.transition(request["request_id"], "acknowledged", evidence="not executed; dispatch unavailable")
+                            response = {
+                                "status": "acknowledged",
+                                "request_id": row["request_id"],
+                                "operation": row["operation"],
+                                "repository": row["repository"],
+                                "state": row["state"],
+                                "evidence": row["evidence"],
+                            }
                     except RequestReuse:
                         response = _error("REQUEST_ID_REUSE")
                     except LedgerFull:
@@ -113,7 +251,7 @@ def handle_connection(conn: socket.socket, authorized_uids: frozenset[int] = AUT
         conn.close()
 
 
-def serve(path: str, authorized_uids: frozenset[int] = AUTHORIZED_PEER_UIDS, ledger=None) -> None:
+def serve(path: str, authorized_uids: frozenset[int] = AUTHORIZED_PEER_UIDS, ledger=None, execution_ops: frozenset[str] = frozenset()) -> None:
     if os.path.exists(path):
         raise RuntimeError("SOCKET_PATH_EXISTS")
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -129,7 +267,7 @@ def serve(path: str, authorized_uids: frozenset[int] = AUTHORIZED_PEER_UIDS, led
                 continue
             active += 1
             try:
-                handle_connection(conn, authorized_uids, ledger)
+                handle_connection(conn, authorized_uids, ledger, execution_ops)
             finally:
                 active -= 1
     finally:

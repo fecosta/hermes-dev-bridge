@@ -76,13 +76,14 @@ def validate_application_files() -> None:
             raise StartupError('TRUSTED_CODE_UNVERIFIED')
 
 
-def startup(ledger_path: Path, worker_uid: int, worker_gid: int, config_path: Path = CONFIG_PATH, policy_path: Path = transport.bridge.POLICY_PATH):
+def startup(ledger_path: Path, worker_uid: int, worker_gid: int, config_path: Path = CONFIG_PATH, policy_path: Path = transport.bridge.POLICY_PATH, execution_config_path: Path = transport.EXECUTION_CONFIG_PATH):
     validate_identity(os.geteuid(), os.getegid(), os.getgroups(), worker_uid, worker_gid)
     validate_application_files()
     validate_policy(policy_path, worker_uid, worker_gid)
     peers = load_peer_uid(config_path)
+    execution_ops = transport.load_execution_allowlist(execution_config_path)
     ledger = Ledger(ledger_path, worker_uid, worker_gid)
-    return peers, ledger
+    return peers, ledger, execution_ops
 
 def recover_acknowledgements(ledger: Ledger) -> None:
     # U3.3 acknowledgements are terminal. Only genuinely incomplete future
@@ -90,12 +91,12 @@ def recover_acknowledgements(ledger: Ledger) -> None:
     for row in ledger.incomplete():
         ledger.transition(row['request_id'], 'recovery-required', error_code='SERVICE_INTERRUPTED', evidence='not executed; recovery required')
 
-def serve_activated(listener: socket.socket, authorized_uids: frozenset[int], ledger: Ledger, stop=None):
+def serve_activated(listener: socket.socket, authorized_uids: frozenset[int], ledger: Ledger, stop=None, execution_ops: frozenset[str] = frozenset()):
     listener.settimeout(0.2)
     while not stop or not stop.is_set():
         try: conn, _ = listener.accept()
         except socket.timeout: continue
-        transport.handle_connection(conn, authorized_uids, ledger)
+        transport.handle_connection(conn, authorized_uids, ledger, execution_ops)
     listener.close()
 
 
@@ -104,11 +105,11 @@ def main() -> int:
     def stop_now(signum, frame): stop.set()
     signal.signal(signal.SIGTERM, stop_now)
     signal.signal(signal.SIGINT, stop_now)
-    peers, ledger = startup(Path(transport.LEDGER_PATH), 997, 988)
+    peers, ledger, execution_ops = startup(Path(transport.LEDGER_PATH), 997, 988)
     try:
         recover_acknowledgements(ledger)
         listener = activated_listener()
-        serve_activated(listener, peers, ledger, stop)
+        serve_activated(listener, peers, ledger, stop, execution_ops=execution_ops)
     finally:
         ledger.close()
     return 0
