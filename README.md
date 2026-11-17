@@ -33,6 +33,18 @@ Check that `id` prints exactly the worker UID and GID with no extra `groups=`; t
 
 Do not run privileged commands automatically. Before staging, verify the installed source is the intended reviewed file and that the worker cannot write `/opt/hermes-dev-bridge`, `/etc/hermes-dev-bridge`, or any parent of `/var/lib/hermes-fixture`.
 
+## One-use execution authorization (U4.4)
+
+Execution requires a durable, operator-controlled one-use grant. The bridge reads grants from `/etc/hermes-dev-bridge/execution.json` at startup. The legacy `{"execute_operations":[...]}` format is rejected; the current format is:
+
+```json
+{"grants":[{"grant_id":"<unique-id>","operation":"smoke"}]}
+```
+
+Each `grant_id` authorizes exactly one execution attempt of the fixed `smoke` fixture. Consumption is recorded in the SQLite ledger and survives restart, failure, timeout, and uncertain (`recovery-required`) outcomes. Hermes cannot create, renew, reset, or revoke grants. Removing a consumed grant from the configuration does not make it available again; adding a new `grant_id` makes one additional attempt available.
+
+Missing or invalid authorization fails closed. If no unconsumed `smoke` grant exists, `bridge_execute_smoke` receives `state: "blocked"`, `error_code: "GRANT_EXHAUSTED"`.
+
 ## Current verification
 
-`python3 -m unittest` runs unprivileged. It covers rejection paths, real subprocess/descendant cleanup (timeout and normal exit, verified dead via `/proc`), `killpg` and survivor fail-closed behavior, the public `execute` cleanup-failure result, the registry limit, and the workspace path checks (using a temporary trusted root). It does not cover the live `/etc` policy, UID/GID switching, or the installed filesystem layout; those require the operator staging above. Until staging and an independent review complete, deterministic fixture execution is **NO-GO**.
+`python3 -m unittest` runs unprivileged. It covers rejection paths, real subprocess/descendant cleanup (timeout and normal exit, verified dead via `/proc`), `killpg` and survivor fail-closed behavior, the public `execute` cleanup-failure result, the registry limit, workspace path checks (using a temporary trusted root), and one-use grant consumption including restart and concurrent admission. It does not cover the live `/etc` policy, UID/GID switching, or the installed filesystem layout; those require the operator staging above. Until staging and an independent review complete, deterministic fixture execution is **NO-GO**.

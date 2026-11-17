@@ -81,9 +81,10 @@ def startup(ledger_path: Path, worker_uid: int, worker_gid: int, config_path: Pa
     validate_application_files()
     validate_policy(policy_path, worker_uid, worker_gid)
     peers = load_peer_uid(config_path)
-    execution_ops = transport.load_execution_allowlist(execution_config_path)
+    execution_grants = transport.load_execution_allowlist(execution_config_path)
     ledger = Ledger(ledger_path, worker_uid, worker_gid)
-    return peers, ledger, execution_ops
+    ledger.load_grants(execution_grants)
+    return peers, ledger, execution_grants
 
 def recover_acknowledgements(ledger: Ledger) -> None:
     # U3.3 acknowledgements are terminal. Only genuinely incomplete future
@@ -95,12 +96,12 @@ def recover_acknowledgements(ledger: Ledger) -> None:
             evidence = 'accepted request interrupted before dispatch; not executed; operator recovery required'
         ledger.transition(row['request_id'], 'recovery-required', error_code='SERVICE_INTERRUPTED', evidence=evidence)
 
-def serve_activated(listener: socket.socket, authorized_uids: frozenset[int], ledger: Ledger, stop=None, execution_ops: frozenset[str] = frozenset()):
+def serve_activated(listener: socket.socket, authorized_uids: frozenset[int], ledger: Ledger, stop=None):
     listener.settimeout(0.2)
     while not stop or not stop.is_set():
         try: conn, _ = listener.accept()
         except socket.timeout: continue
-        transport.handle_connection(conn, authorized_uids, ledger, execution_ops)
+        transport.handle_connection(conn, authorized_uids, ledger)
     listener.close()
 
 
@@ -109,11 +110,11 @@ def main() -> int:
     def stop_now(signum, frame): stop.set()
     signal.signal(signal.SIGTERM, stop_now)
     signal.signal(signal.SIGINT, stop_now)
-    peers, ledger, execution_ops = startup(Path(transport.LEDGER_PATH), 997, 988)
+    peers, ledger, _execution_grants = startup(Path(transport.LEDGER_PATH), 997, 988)
     try:
         recover_acknowledgements(ledger)
         listener = activated_listener()
-        serve_activated(listener, peers, ledger, stop, execution_ops=execution_ops)
+        serve_activated(listener, peers, ledger, stop)
     finally:
         ledger.close()
     return 0

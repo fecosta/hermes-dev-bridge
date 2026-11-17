@@ -87,6 +87,13 @@ class ExecuteSmokeTests(unittest.TestCase):
         self.assertEqual(result["error"], "EXECUTION_DISABLED")
         self.assertEqual(result["state"], "blocked")
 
+    def test_grant_exhausted(self):
+        result, _ = self.call(self._base_response("completed", "blocked", error_code="GRANT_EXHAUSTED"))
+        self.assertFalse(result["success"])
+        self.assertFalse(result["executed"])
+        self.assertEqual(result["error"], "GRANT_EXHAUSTED")
+        self.assertEqual(result["state"], "blocked")
+
     def test_unauthorized_blocked_operation(self):
         result, _ = self.call(self._base_response("completed", "blocked", error_code="IDENTITY_MISMATCH"))
         self.assertFalse(result["success"])

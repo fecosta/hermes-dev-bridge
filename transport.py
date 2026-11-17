@@ -46,20 +46,36 @@ def _trusted_chain(path: Path) -> bool:
         return False
 
 
-def load_execution_allowlist(path: Path = EXECUTION_CONFIG_PATH) -> frozenset[str]:
-    """Operator-controlled execution allowlist. Missing config disables execution."""
+def load_execution_allowlist(path: Path = EXECUTION_CONFIG_PATH) -> list[dict[str, str]]:
+    """Operator-controlled one-use execution grants. Missing config disables execution.
+    Legacy execute_operations format is rejected; each grant authorizes one attempt."""
     if not path.exists():
-        return frozenset()
+        return []
     if not _trusted_chain(path) or not _secure_file(path):
         raise RuntimeError("EXECUTION_CONFIG_UNVERIFIED")
     try:
         value = json.loads(path.read_text())
-        if not isinstance(value, dict) or set(value.keys()) != {"execute_operations"}:
+        if not isinstance(value, dict) or set(value.keys()) != {"grants"}:
             raise RuntimeError("EXECUTION_CONFIG_INVALID")
-        ops = value["execute_operations"]
-        if not isinstance(ops, list) or not all(isinstance(op, str) and op in bridge.ALLOWED_OPERATIONS for op in ops):
+        grants = value["grants"]
+        if not isinstance(grants, list):
             raise RuntimeError("EXECUTION_CONFIG_INVALID")
-        return frozenset(ops)
+        seen = set()
+        result = []
+        for grant in grants:
+            if not isinstance(grant, dict) or set(grant.keys()) != {"grant_id", "operation"}:
+                raise RuntimeError("EXECUTION_CONFIG_INVALID")
+            grant_id = grant["grant_id"]
+            operation = grant["operation"]
+            if not isinstance(grant_id, str) or not isinstance(operation, str):
+                raise RuntimeError("EXECUTION_CONFIG_INVALID")
+            if operation != "smoke":
+                raise RuntimeError("EXECUTION_CONFIG_INVALID")
+            if grant_id in seen:
+                raise RuntimeError("EXECUTION_CONFIG_INVALID")
+            seen.add(grant_id)
+            result.append({"grant_id": grant_id, "operation": operation})
+        return result
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError("EXECUTION_CONFIG_UNVERIFIED") from exc
 
@@ -170,7 +186,7 @@ def _map_bridge_result(ledger: Ledger, request_id: str, result: dict[str, Any]) 
     return ledger.transition(request_id, "blocked", evidence=result.get("error") or f"bridge returned {status}", error_code="BRIDGE_REJECTED")
 
 
-def handle_connection(conn: socket.socket, authorized_uids: frozenset[int] = AUTHORIZED_PEER_UIDS, ledger=None, execution_ops: frozenset[str] = frozenset()) -> None:
+def handle_connection(conn: socket.socket, authorized_uids: frozenset[int] = AUTHORIZED_PEER_UIDS, ledger=None) -> None:
     conn.settimeout(READ_TIMEOUT)
     try:
         if _peer_uid(conn) not in authorized_uids:
@@ -193,15 +209,7 @@ def handle_connection(conn: socket.socket, authorized_uids: frozenset[int] = AUT
                         ledger = ledger or Ledger(LEDGER_PATH)
                         row = ledger.reserve(request)
                         if request.get("execute"):
-                            if request["operation"] not in execution_ops:
-                                if row["state"] == "accepted":
-                                    row = ledger.transition(
-                                        request["request_id"], "blocked",
-                                        error_code="EXECUTION_DISABLED",
-                                        evidence="execution disabled or operation not authorized",
-                                    )
-                                response = _terminal_response(row)
-                            elif row["state"] != "accepted":
+                            if row["state"] != "accepted":
                                 response = _terminal_response(row)
                             else:
                                 claimed = ledger.dispatch_running(request["request_id"])
@@ -209,24 +217,33 @@ def handle_connection(conn: socket.socket, authorized_uids: frozenset[int] = AUT
                                     row = ledger.get(request["request_id"])
                                     response = _terminal_response(row)
                                 else:
-                                    bridge_request = {
-                                        "run_id": request["request_id"],
-                                        "operation": request["operation"],
-                                        "repository": request["repository"],
-                                        "timeout_seconds": request.get("timeout_seconds", bridge.DEFAULT_TIMEOUT),
-                                    }
-                                    try:
-                                        result = bridge.execute(bridge_request)
-                                    except Exception as exc:
+                                    grant_id = ledger.consume_grant(request["operation"], request["request_id"])
+                                    if grant_id is None:
                                         row = ledger.transition(
-                                            request["request_id"], "recovery-required",
-                                            error_code="EXECUTION_UNCERTAIN",
-                                            evidence=bridge._sanitize(str(exc)),
+                                            request["request_id"], "blocked",
+                                            error_code="GRANT_EXHAUSTED",
+                                            evidence="execution grant exhausted or unavailable",
                                         )
                                         response = _terminal_response(row)
                                     else:
-                                        row = _map_bridge_result(ledger, request["request_id"], result)
-                                        response = _terminal_response(row)
+                                        bridge_request = {
+                                            "run_id": request["request_id"],
+                                            "operation": request["operation"],
+                                            "repository": request["repository"],
+                                            "timeout_seconds": request.get("timeout_seconds", bridge.DEFAULT_TIMEOUT),
+                                        }
+                                        try:
+                                            result = bridge.execute(bridge_request)
+                                        except Exception as exc:
+                                            row = ledger.transition(
+                                                request["request_id"], "recovery-required",
+                                                error_code="EXECUTION_UNCERTAIN",
+                                                evidence=bridge._sanitize(str(exc)),
+                                            )
+                                            response = _terminal_response(row)
+                                        else:
+                                            row = _map_bridge_result(ledger, request["request_id"], result)
+                                            response = _terminal_response(row)
                         else:
                             if row["state"] == "accepted":
                                 row = ledger.transition(request["request_id"], "acknowledged", evidence="not executed; dispatch unavailable")
@@ -251,7 +268,7 @@ def handle_connection(conn: socket.socket, authorized_uids: frozenset[int] = AUT
         conn.close()
 
 
-def serve(path: str, authorized_uids: frozenset[int] = AUTHORIZED_PEER_UIDS, ledger=None, execution_ops: frozenset[str] = frozenset()) -> None:
+def serve(path: str, authorized_uids: frozenset[int] = AUTHORIZED_PEER_UIDS, ledger=None) -> None:
     if os.path.exists(path):
         raise RuntimeError("SOCKET_PATH_EXISTS")
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -267,7 +284,7 @@ def serve(path: str, authorized_uids: frozenset[int] = AUTHORIZED_PEER_UIDS, led
                 continue
             active += 1
             try:
-                handle_connection(conn, authorized_uids, ledger, execution_ops)
+                handle_connection(conn, authorized_uids, ledger)
             finally:
                 active -= 1
     finally:

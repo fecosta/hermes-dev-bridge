@@ -31,6 +31,13 @@ _SCHEMA = """CREATE TABLE IF NOT EXISTS runs (
  CHECK(state IN ('accepted','acknowledged','running','passed','failed','blocked','recovery-required'))
 )"""
 
+_GRANTS_SCHEMA = """CREATE TABLE IF NOT EXISTS grants (
+ grant_id TEXT PRIMARY KEY, operation TEXT NOT NULL, available INTEGER NOT NULL DEFAULT 0,
+ consumed_at REAL, request_id TEXT, outcome TEXT,
+ CHECK(operation IN ('smoke')),
+ CHECK(available IN (0,1))
+)"""
+
 
 def canonical_hash(request: dict[str, Any]) -> str:
     keys = ("request_id", "operation", "repository", "timeout_seconds")
@@ -61,6 +68,7 @@ class Ledger:
             self.db.execute("PRAGMA journal_mode=DELETE")
             self.db.execute("PRAGMA synchronous=FULL")
             self.db.execute(_SCHEMA)
+            self.db.execute(_GRANTS_SCHEMA)
         except (OSError, sqlite3.Error) as exc:
             raise LedgerError("LEDGER_UNAVAILABLE") from exc
         self._check_capacity()
@@ -99,6 +107,57 @@ class Ledger:
             # copy can exceed the configured storage ceiling. Reclaiming pages
             # is deferred to an operator-controlled maintenance window.
         except sqlite3.Error as exc: raise LedgerError("LEDGER_UNAVAILABLE") from exc
+
+    def load_grants(self, grants: list[dict[str, str]]) -> None:
+        """Load operator-configured one-use grants. Consumed grants stay consumed.
+        Grants not present in the configuration become unavailable."""
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            self.db.execute("UPDATE grants SET available=0")
+            for grant in grants:
+                grant_id = grant["grant_id"]
+                operation = grant["operation"]
+                self.db.execute(
+                    "INSERT OR IGNORE INTO grants (grant_id, operation, available) VALUES (?, ?, 0)",
+                    (grant_id, operation),
+                )
+                self.db.execute(
+                    "UPDATE grants SET available=1 WHERE grant_id=? AND operation=? AND consumed_at IS NULL",
+                    (grant_id, operation),
+                )
+            self.db.execute("COMMIT")
+        except (sqlite3.Error, OSError) as exc:
+            try: self.db.execute("ROLLBACK")
+            except sqlite3.Error: pass
+            raise LedgerError("LEDGER_UNAVAILABLE") from exc
+
+    def consume_grant(self, operation: str, request_id: str) -> str | None:
+        """Atomically consume one available grant for operation. Returns grant_id or None."""
+        now = time.time()
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute(
+                "SELECT grant_id FROM grants WHERE operation=? AND available=1 LIMIT 1",
+                (operation,),
+            ).fetchone()
+            if row is None:
+                self.db.execute("COMMIT")
+                return None
+            grant_id = row[0]
+            cur = self.db.execute(
+                "UPDATE grants SET available=0, consumed_at=?, request_id=?, outcome='consumed' "
+                "WHERE grant_id=? AND available=1",
+                (now, request_id, grant_id),
+            )
+            if cur.rowcount != 1:
+                self.db.execute("COMMIT")
+                return None
+            self.db.execute("COMMIT")
+            return grant_id
+        except (sqlite3.Error, OSError) as exc:
+            try: self.db.execute("ROLLBACK")
+            except sqlite3.Error: pass
+            raise LedgerError("LEDGER_UNAVAILABLE") from exc
 
     def reserve(self, request: dict[str, Any]) -> dict[str, Any]:
         h = canonical_hash(request)

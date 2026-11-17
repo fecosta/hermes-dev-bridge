@@ -1,4 +1,4 @@
-import os, tempfile, unittest
+import os, tempfile, threading, unittest
 from pathlib import Path
 from ledger import Ledger, LedgerError, RequestReuse
 
@@ -24,5 +24,41 @@ class LedgerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             os.chmod(d,0o775)
             with self.assertRaises(LedgerError): self.make(d)
+
+    def test_load_grants_marks_consumed_unavailable(self):
+        with tempfile.TemporaryDirectory() as d:
+            l,_=self.make(d)
+            l.load_grants([{"grant_id":"g1","operation":"smoke"}])
+            self.assertEqual(l.consume_grant("smoke","r1"),"g1")
+            l.load_grants([{"grant_id":"g1","operation":"smoke"}])
+            self.assertIsNone(l.consume_grant("smoke","r2"))
+            l.close()
+
+    def test_load_grants_removes_unconfigured_grants(self):
+        with tempfile.TemporaryDirectory() as d:
+            l,_=self.make(d)
+            l.load_grants([{"grant_id":"g1","operation":"smoke"},{"grant_id":"g2","operation":"smoke"}])
+            self.assertEqual(l.consume_grant("smoke","r1"),"g1")
+            l.load_grants([{"grant_id":"g2","operation":"smoke"}])
+            self.assertEqual(l.consume_grant("smoke","r2"),"g2")
+            self.assertIsNone(l.consume_grant("smoke","r3"))
+            l.close()
+
+    def test_consume_grant_atomic(self):
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'runs.sqlite3'
+            l=Ledger(path,os.getuid(),os.getgid())
+            l.load_grants([{"grant_id":"g1","operation":"smoke"}])
+            l.close()
+            results=[]
+            def attempt():
+                lx=Ledger(path,os.getuid(),os.getgid())
+                results.append(lx.consume_grant("smoke", "rx"))
+                lx.close()
+            threads=[threading.Thread(target=attempt) for _ in range(4)]
+            [t.start() for t in threads]
+            [t.join() for t in threads]
+            self.assertEqual(sum(1 for r in results if r is not None),1)
+            self.assertEqual(sum(1 for r in results if r == "g1"),1)
 
 if __name__=='__main__': unittest.main()
