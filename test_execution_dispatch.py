@@ -266,6 +266,7 @@ class ExecutionDispatchTests(unittest.TestCase):
             self.assertEqual(row["state"], "recovery-required")
             self.assertEqual(row["error_code"], "SERVICE_INTERRUPTED")
             self.assertIn("outcome unknown", row["evidence"])
+            self.assertNotIn("not executed", row["evidence"])
             ledger2.close()
 
     def test_execute_unauthorized_operation_blocked(self):

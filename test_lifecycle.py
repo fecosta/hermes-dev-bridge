@@ -29,7 +29,7 @@ class LifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             l=Ledger(Path(d)/'runs.sqlite3',os.getuid(),os.getgid()); r={'request_id':'r','operation':'smoke','repository':'fixture','timeout_seconds':5}; l.reserve(r); l.dispatch_running('r')
             lifecycle.recover_acknowledgements(l)
-            self.assertEqual(l.get('r')['state'],'recovery-required'); self.assertEqual(l.get('r')['error_code'],'SERVICE_INTERRUPTED'); self.assertIn('outcome unknown', l.get('r')['evidence']); l.close()
+            row=l.get('r'); self.assertEqual(row['state'],'recovery-required'); self.assertEqual(row['error_code'],'SERVICE_INTERRUPTED'); self.assertIn('outcome unknown', row['evidence']); self.assertNotIn('not executed', row['evidence']); l.close()
     def test_trusted_chain_rejects_symlink(self):
         with tempfile.TemporaryDirectory() as d:
             real=Path(d)/'real'; real.write_text('x'); link=Path(d)/'link'; link.symlink_to(real)
