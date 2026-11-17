@@ -219,24 +219,24 @@ class ExecutionDispatchTests(unittest.TestCase):
             def run():
                 ledger = Ledger(path, os.getuid(), os.getgid())
                 left, right = socket.socketpair()
-                with mock.patch.object(transport, "_peer_uid", return_value=os.getuid()):
-                    thread = threading.Thread(
-                        target=transport.handle_connection,
-                        args=(right, frozenset({os.getuid()}), ledger, frozenset({"smoke"})),
-                    )
-                    thread.start()
-                    barrier.wait()
-                    try:
-                        left.sendall(b'{"request_id":"same","operation":"smoke","repository":"fixture","execute":true}\n')
-                    except BrokenPipeError:
-                        pass
-                    data = left.recv(4096)
-                    thread.join()
+                thread = threading.Thread(
+                    target=transport.handle_connection,
+                    args=(right, frozenset({os.getuid()}), ledger, frozenset({"smoke"})),
+                )
+                thread.start()
+                barrier.wait()
+                try:
+                    left.sendall(b'{"request_id":"same","operation":"smoke","repository":"fixture","execute":true}\n')
+                except BrokenPipeError:
+                    pass
+                data = left.recv(4096)
+                thread.join()
                 left.close()
                 ledger.close()
                 results.append(json.loads(data))
 
-            with mock.patch.object(transport.bridge, "execute", side_effect=fake_execute) as m:
+            with mock.patch.object(transport.bridge, "execute", side_effect=fake_execute) as m, \
+                 mock.patch.object(transport, "_peer_uid", return_value=os.getuid()):
                 threads = [threading.Thread(target=run) for _ in range(2)]
                 [t.start() for t in threads]
                 [t.join() for t in threads]
