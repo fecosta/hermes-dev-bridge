@@ -24,7 +24,12 @@ class LifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             l=Ledger(Path(d)/'runs.sqlite3',os.getuid(),os.getgid()); r={'request_id':'r','operation':'smoke','repository':'fixture','timeout_seconds':5}; l.reserve(r)
             lifecycle.recover_acknowledgements(l)
-            self.assertEqual(l.get('r')['state'],'recovery-required'); self.assertEqual(l.get('r')['error_code'],'SERVICE_INTERRUPTED'); l.close()
+            self.assertEqual(l.get('r')['state'],'recovery-required'); self.assertEqual(l.get('r')['error_code'],'SERVICE_INTERRUPTED'); self.assertIn('not executed', l.get('r')['evidence']); l.close()
+    def test_recovery_running_outcome_unknown(self):
+        with tempfile.TemporaryDirectory() as d:
+            l=Ledger(Path(d)/'runs.sqlite3',os.getuid(),os.getgid()); r={'request_id':'r','operation':'smoke','repository':'fixture','timeout_seconds':5}; l.reserve(r); l.dispatch_running('r')
+            lifecycle.recover_acknowledgements(l)
+            self.assertEqual(l.get('r')['state'],'recovery-required'); self.assertEqual(l.get('r')['error_code'],'SERVICE_INTERRUPTED'); self.assertIn('outcome unknown', l.get('r')['evidence']); l.close()
     def test_trusted_chain_rejects_symlink(self):
         with tempfile.TemporaryDirectory() as d:
             real=Path(d)/'real'; real.write_text('x'); link=Path(d)/'link'; link.symlink_to(real)

@@ -89,7 +89,11 @@ def recover_acknowledgements(ledger: Ledger) -> None:
     # U3.3 acknowledgements are terminal. Only genuinely incomplete future
     # states are marked; this service never dispatches old work.
     for row in ledger.incomplete():
-        ledger.transition(row['request_id'], 'recovery-required', error_code='SERVICE_INTERRUPTED', evidence='not executed; recovery required')
+        if row['state'] == 'running':
+            evidence = 'running request interrupted; execution outcome unknown; operator recovery required'
+        else:
+            evidence = 'accepted request interrupted before dispatch; not executed; operator recovery required'
+        ledger.transition(row['request_id'], 'recovery-required', error_code='SERVICE_INTERRUPTED', evidence=evidence)
 
 def serve_activated(listener: socket.socket, authorized_uids: frozenset[int], ledger: Ledger, stop=None, execution_ops: frozenset[str] = frozenset()):
     listener.settimeout(0.2)

@@ -262,7 +262,10 @@ class ExecutionDispatchTests(unittest.TestCase):
 
             ledger2 = Ledger(os.path.join(d, "runs.sqlite3"), os.getuid(), os.getgid())
             lifecycle.recover_acknowledgements(ledger2)
-            self.assertEqual(ledger2.get("r1")["state"], "recovery-required")
+            row = ledger2.get("r1")
+            self.assertEqual(row["state"], "recovery-required")
+            self.assertEqual(row["error_code"], "SERVICE_INTERRUPTED")
+            self.assertIn("outcome unknown", row["evidence"])
             ledger2.close()
 
     def test_execute_unauthorized_operation_blocked(self):
